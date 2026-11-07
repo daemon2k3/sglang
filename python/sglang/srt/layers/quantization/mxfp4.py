@@ -1343,21 +1343,44 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
 
-        # ---- Per-expert SwiGLU scalars (read from runner config, fallback to GPT-OSS defaults)
-        _sm90_alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
-        _sm90_limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
-        layer.swiglu_alpha = Parameter(
-            torch.full((E,), _sm90_alpha, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        layer.swiglu_beta = Parameter(
-            torch.full((E,), 1.0, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        layer.swiglu_limit = Parameter(
-            torch.full((E,), _sm90_limit, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
+        # ---- Per-expert activation scalars.
+        # SiTU carries its own clamp inside the activation, so the kernel must
+        # receive situ_beta / situ_linear_beta and NO SwiGLU override (this
+        # mirrors materialize_swiglu_params_for_cutlass, which returns all-None
+        # for situ). Feeding SiTU params into the GPT-OSS SwiGLU slots makes the
+        # kernel compute g*sigmoid(4g)*(u+1) clamped at 25 instead of
+        # 4*tanh(g/4)*sigmoid(g)*25*tanh(u/25) -> garbage logits.
+        if getattr(layer.moe_runner_config, "activation", None) == "situ":
+            _situ_beta = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 4.0
+            _situ_linear_beta = (
+                getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 25.0
+            )
+            layer.situ_beta = Parameter(
+                torch.full((E,), _situ_beta, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.situ_linear_beta = Parameter(
+                torch.full((E,), _situ_linear_beta, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.swiglu_alpha = None
+            layer.swiglu_beta = None
+            layer.swiglu_limit = None
+        else:
+            _sm90_alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
+            _sm90_limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
+            layer.swiglu_alpha = Parameter(
+                torch.full((E,), _sm90_alpha, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.swiglu_beta = Parameter(
+                torch.full((E,), 1.0, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+            layer.swiglu_limit = Parameter(
+                torch.full((E,), _sm90_limit, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
 
         # ---- FlashInfer SM90 byte / scale interleave -----------------------
         # The padded buffers above are contiguous by construction (allocated
@@ -1570,9 +1593,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             humming_fc2_act_scale=getattr(layer, "humming_fc2_act_scale", None),
             w13_bias=layer.w13_weight_bias,
             w2_bias=layer.w2_weight_bias,
-            swiglu_alpha=layer.swiglu_alpha,
-            swiglu_beta=layer.swiglu_beta,
-            swiglu_limit=layer.swiglu_limit,
+            swiglu_alpha=getattr(layer, "swiglu_alpha", None),
+            swiglu_beta=getattr(layer, "swiglu_beta", None),
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
+            situ_beta=getattr(layer, "situ_beta", None),
+            situ_linear_beta=getattr(layer, "situ_linear_beta", None),
             padded_hidden=self._padded_hidden,
         )
         return self.runner.run(dispatch_output, quant_info)

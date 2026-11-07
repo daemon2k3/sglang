@@ -9,6 +9,9 @@ at load time.
 """
 
 import functools
+import logging
+
+logger = logging.getLogger(__name__)
 import math
 import re
 from typing import Dict, List, Optional, Union
@@ -211,7 +214,13 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         images = images or kwargs.pop("images", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
         if images and torch.cuda.is_available():
-            return self._gpu_call(text, images, original_input_ids)
+            try:
+                return self._gpu_call(text, images, original_input_ids)
+            except torch.OutOfMemoryError:
+                logger.warning(
+                    "GPU image preprocessing OOM (GPU0 budget exhausted); "
+                    "falling back to CPU image preprocessing"
+                )
         return self._cpu_call(text, images, original_input_ids, **kwargs)
 
     def _gpu_call(self, text, images, original_input_ids=None):

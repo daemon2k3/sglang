@@ -66,6 +66,12 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     swiglu_alpha: Optional[torch.Tensor] = None
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
+
+    # SiTU activation params, fp32 [E]. When set, FlashInfer encodes SiTU as
+    # Swiglu + situ_beta (runners.py:426-433), so the swiglu_* overrides above
+    # must stay None.
+    situ_beta: Optional[torch.Tensor] = None
+    situ_linear_beta: Optional[torch.Tensor] = None
     apply_routed_scaling_factor: bool = True
     pair_w2_weight: Optional[torch.Tensor] = None
 
@@ -144,6 +150,12 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     swiglu_alpha: Optional[torch.Tensor] = None
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
+
+    # SiTU activation params, fp32 [E]. When set, FlashInfer encodes SiTU as
+    # Swiglu + situ_beta (runners.py:426-433), so the swiglu_* overrides above
+    # must stay None.
+    situ_beta: Optional[torch.Tensor] = None
+    situ_linear_beta: Optional[torch.Tensor] = None
 
     # Bailing clamps after SiLU, which the kernel only implements in its
     # SwigluStep variant.
@@ -577,6 +589,13 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     # new keyword at all on the existing W4A16/MXFP8 paths, so those paths keep
     # working with SGLang's currently pinned release.
     humming_kwargs = {"use_wfp4afp8_humming": True} if use_wfp4afp8_humming else {}
+    # SiTU: hand the activation its own beta/clamp; swiglu_* stay None.
+    situ_kwargs = {}
+    if getattr(quant_info, "situ_beta", None) is not None:
+        situ_kwargs = {
+            "situ_beta": quant_info.situ_beta,
+            "situ_linear_beta": quant_info.situ_linear_beta,
+        }
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
     ):
@@ -603,14 +622,19 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         activation_type=(
-            ActivationType.SwigluStep
-            if quant_info.use_swiglu_step
-            else ActivationType.Swiglu
+            ActivationType.Situ
+            if getattr(quant_info, "situ_beta", None) is not None
+            else (
+                ActivationType.SwigluStep
+                if quant_info.use_swiglu_step
+                else ActivationType.Swiglu
+            )
         ),
         tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
         **humming_kwargs,
+        **situ_kwargs,
     )
 
     if do_pad:
