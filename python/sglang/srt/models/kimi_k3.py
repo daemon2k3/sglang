@@ -3661,11 +3661,6 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
 
-            # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
-            if "weight_packed" in name and not _is_npu:
-                name = name.replace("weight_packed", "weight")
-
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
             if ".q_a_proj." in name or ".kv_a_proj_with_mqa." in name:
                 is_q_a = ".q_a_proj." in name
@@ -3738,11 +3733,33 @@ class KimiK3LinearForCausalLM(nn.Module):
                 )
                 if expert_entry is not None:
                     param_name, weight_name, expert_id, shard_id = expert_entry
-                    name = name.replace(weight_name, param_name)
-                    # Skip experts of layers outside a truncated config (e.g.
-                    # num_hidden_layers override), mirroring the non-expert
-                    # `name not in params_dict` guard below.
-                    if name in params_dict:
+                    mapped_name = name.replace(weight_name, param_name)
+                    # Preserve the checkpoint-native packed name for Humming.
+                    # Native Mxfp4MoEMethod registers the same fused parameter
+                    # without the `_packed` suffix, so resolve that alias only
+                    # when the exact parameter is absent.
+                    candidate_names = [mapped_name]
+                    if mapped_name.endswith("_weight_packed"):
+                        candidate_names.append(mapped_name.removesuffix("_packed"))
+                    resolved_name = next(
+                        (
+                            candidate_name
+                            for candidate_name in candidate_names
+                            if candidate_name in params_dict
+                        ),
+                        None,
+                    )
+                    if resolved_name is None:
+                        if name.endswith((".weight_packed", ".weight_scale")):
+                            raise RuntimeError(
+                                "Unable to map required Kimi-K3 expert tensor "
+                                f"{name!r}; expected one of {candidate_names!r}"
+                            )
+                        # Skip experts of layers outside a truncated config (e.g.
+                        # num_hidden_layers override), mirroring the non-expert
+                        # `name not in params_dict` guard below.
+                    else:
+                        name = resolved_name
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(
