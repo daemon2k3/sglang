@@ -2322,14 +2322,23 @@ class KimiK3DeltaAttention(nn.Module):
         w = layer.conv_weights
         if _is_npu:
             return
-        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        # H = local KDA heads = 96 / TP. The fused kernel supports H in
+        # {3, 6, 12} (TP32/16/8) -- see kda_fused_decode._SUPPORTED_HEADS.
+        # Derive seg from the actual conv layout instead of assuming TP8.
+        if w is None or w.ndim != 2 or w.shape[1] != 4:
+            rank0_log(
+                "K3 fused KDA decode disabled: unexpected conv layout "
+                f"(conv {None if w is None else tuple(w.shape)})"
+            )
+            return
+        seg = w.shape[0] // 3
+        H = seg // 128
         if (
-            w is None
-            or w.ndim != 2
-            or w.shape != (3 * seg, 4)
+            seg != H * 128
+            or H not in (3, 6, 12)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or layer.A_log.numel() != H
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
@@ -2356,7 +2365,7 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [H]
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
