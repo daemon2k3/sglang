@@ -2877,6 +2877,33 @@ def update_sliding_window_buffer(
             window_kv_indptr[-1], dtype=torch.int64, device=device
         )
     window_kv_start_idx = seq_lens - window_kv_lens
+    # Draft KV ring: the draft pool holds only rows_per_req rows per request, so
+    # the window ids must be ring rows, not the target-scale ids a req_to_token
+    # gather would produce.
+    from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
+
+    ring = get_draft_kv_ring()
+    if ring is not None:
+        lens = window_kv_lens.to(torch.int64)
+        starts = window_kv_start_idx.to(torch.int64)
+        total = int(window_kv_indptr[-1].item())
+        if total > 0:
+            req_of = torch.repeat_interleave(
+                torch.arange(bs, device=lens.device), lens, output_size=total
+            )
+            offs = torch.arange(total, device=lens.device) - window_kv_indptr[
+                req_of
+            ].to(torch.int64)
+            positions = starts[req_of] + offs
+            window_kv_indices[:total] = ring.locs(
+                req_pool_indices[req_of], positions
+            )
+        return (
+            window_kv_indptr,
+            window_kv_indices,
+            window_kv_lens,
+            window_kv_start_idx,
+        )
     token_mapping = (
         token_to_kv_pool.full_to_swa_index_mapping
         if isinstance(token_to_kv_pool, SWAKVPool)
